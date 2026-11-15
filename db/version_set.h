@@ -31,6 +31,8 @@ class Writer;
 }
 
 class Compaction;
+class LogTailer;
+class SharedState;
 class Iterator;
 class MemTable;
 class TableBuilder;
@@ -114,6 +116,10 @@ class Version {
   // Return a human readable string that describes this version's contents.
   std::string DebugString() const;
 
+  // Multi-process only: the manifest epoch (see util/shared_state.h) at
+  // which this version became current.
+  uint64_t epoch() const { return epoch_; }
+
  private:
   friend class Compaction;
   friend class VersionSet;
@@ -149,6 +155,9 @@ class Version {
   Version* next_;     // Next version in linked list
   Version* prev_;     // Previous version in linked list
   int refs_;          // Number of live refs to this version
+  // Multi-process only: the manifest epoch (see util/shared_state.h) at
+  // which this version became current.
+  uint64_t epoch_ = 0;
 
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
@@ -191,16 +200,53 @@ class VersionSet {
   uint64_t ManifestFileNumber() const { return manifest_file_number_; }
 
   // Allocate and return a new file number
-  uint64_t NewFileNumber() { return next_file_number_++; }
+  uint64_t NewFileNumber();
 
   // Arrange to reuse "file_number" unless a newer file number has
   // already been allocated.
   // REQUIRES: "file_number" was returned by a call to NewFileNumber().
   void ReuseFileNumber(uint64_t file_number) {
-    if (next_file_number_ == file_number + 1) {
+    // In multi-process mode other processes draw from the same counter, so
+    // a number is never handed back.
+    if (shared_ == nullptr && next_file_number_ == file_number + 1) {
       next_file_number_ = file_number;
     }
   }
+
+  // ---- Multi-process support (Options::multi_process) ----
+  //
+  // In multi-process mode this VersionSet does not own the MANIFEST.  File
+  // numbers come from *shared, and the version state is either
+  //   - followed: TailManifest() applies the edits another process wrote, or
+  //   - written:  after BecomeManifestWriter(), LogAndApply() appends edits
+  //     and publishes them through *shared.
+
+  // REQUIRES: called before any other method.
+  void SetSharedState(SharedState* shared) { shared_ = shared; }
+
+  // Bring the version state up to the first "manifest_offset" bytes of
+  // MANIFEST-"manifest_number" and give the resulting version "epoch".
+  // Returns a NotFound status if that manifest no longer exists, in which
+  // case the caller should retry with newer coordinates.
+  // REQUIRES: !IsManifestWriter()
+  Status TailManifest(uint64_t manifest_number, uint64_t manifest_offset,
+                      uint64_t epoch);
+
+  // Stop following.  The next LogAndApply() starts a new MANIFEST.
+  // REQUIRES: the state is fully caught up and this process holds the
+  // cross-process compaction lock.
+  void BecomeManifestWriter();
+  bool IsManifestWriter() const { return manifest_writer_; }
+
+  // The epoch that a reader of this process pins: that of the oldest live
+  // version, or SharedState::kNone if the only live version is the current
+  // one and nothing but this VersionSet references it.
+  uint64_t OldestPinnedEpoch() const;
+
+  // Largest last-sequence recorded in the manifest edits followed so far.
+  // The sequence a follower may expose comes from the WAL state instead;
+  // this is only used to rebuild that state when the database is opened.
+  uint64_t ManifestLastSequence() const { return manifest_last_sequence_; }
 
   // Return the number of Table files at the specified level.
   int NumLevelFiles(int level) const;
@@ -309,6 +355,14 @@ class VersionSet {
   log::Writer* descriptor_log_;
   Version dummy_versions_;  // Head of circular doubly-linked list of versions.
   Version* current_;        // == dummy_versions_.prev_
+
+  // Multi-process state.  shared_ is null in single-process mode.
+  SharedState* shared_;
+  bool manifest_writer_;
+  LogTailer* manifest_tailer_;
+  uint64_t tailed_manifest_number_;  // 0: none
+  // Largest last-sequence recorded in any edit seen by TailManifest().
+  uint64_t manifest_last_sequence_ = 0;
 
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.

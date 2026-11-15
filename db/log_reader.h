@@ -60,6 +60,21 @@ class Reader {
   // Undefined before the first call to ReadRecord.
   uint64_t LastRecordOffset();
 
+  // Returns the physical offset just past the last record returned by
+  // ReadRecord.
+  //
+  // Undefined before the first call to ReadRecord.
+  uint64_t Position() const { return end_of_buffer_offset_ - buffer_.size(); }
+
+  // ReadRecord() remembers that it hit the end of the file and from then on
+  // keeps returning false.  Call UnmarkEOF() to make the reader look at the
+  // file again, for example after the file has grown.
+  //
+  // REQUIRES: the last ReadRecord() call stopped at a record boundary, i.e.
+  // the reader did not see a partially written record.  A reader over a file
+  // that only ever exposes complete records satisfies this.
+  void UnmarkEOF();
+
  private:
   // Extend record types with the following special values
   enum {
@@ -91,6 +106,9 @@ class Reader {
   char* const backing_store_;
   Slice buffer_;
   bool eof_;  // Last Read() indicated EOF by returning < kBlockSize
+  // If the last Read() was short, the number of bytes of the current block
+  // that are in backing_store_; otherwise 0.
+  size_t eof_offset_;
 
   // Offset of the last record returned by ReadRecord.
   uint64_t last_record_offset_;

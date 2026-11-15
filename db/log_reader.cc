@@ -5,8 +5,10 @@
 #include "db/log_reader.h"
 
 #include <cstdio>
+#include <cstring>
 
 #include "leveldb/env.h"
+
 #include "util/coding.h"
 #include "util/crc32c.h"
 
@@ -23,6 +25,7 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
       backing_store_(new char[kBlockSize]),
       buffer_(),
       eof_(false),
+      eof_offset_(0),
       last_record_offset_(0),
       end_of_buffer_offset_(0),
       initial_offset_(initial_offset),
@@ -186,6 +189,43 @@ void Reader::ReportDrop(uint64_t bytes, const Status& reason) {
   }
 }
 
+void Reader::UnmarkEOF() {
+  if (!eof_) {
+    return;
+  }
+  eof_ = false;
+  if (eof_offset_ == 0) {
+    // The last read ended exactly on a block boundary (or returned nothing).
+    return;
+  }
+
+  // The last read returned a partial block.  Read the rest of that block
+  // behind what is already in backing_store_ so that block boundaries stay
+  // where the writer put them.
+  const size_t consumed = eof_offset_ - buffer_.size();
+  const size_t remaining = kBlockSize - eof_offset_;
+  Slice more;
+  Status status = file_->Read(remaining, &more, backing_store_ + eof_offset_);
+  if (!status.ok()) {
+    buffer_.clear();
+    ReportDrop(remaining, status);
+    eof_ = true;
+    return;
+  }
+  if (more.size() > 0 && more.data() != backing_store_ + eof_offset_) {
+    std::memmove(backing_store_ + eof_offset_, more.data(), more.size());
+  }
+  end_of_buffer_offset_ += more.size();
+  buffer_ =
+      Slice(backing_store_ + consumed, eof_offset_ + more.size() - consumed);
+  if (more.size() < remaining) {
+    eof_ = true;
+    eof_offset_ += more.size();
+  } else {
+    eof_offset_ = 0;
+  }
+}
+
 unsigned int Reader::ReadPhysicalRecord(Slice* result) {
   while (true) {
     if (buffer_.size() < kHeaderSize) {
@@ -201,6 +241,9 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
           return kEof;
         } else if (buffer_.size() < kBlockSize) {
           eof_ = true;
+          eof_offset_ = buffer_.size();
+        } else {
+          eof_offset_ = 0;
         }
         continue;
       } else {

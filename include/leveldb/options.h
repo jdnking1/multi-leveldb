@@ -70,6 +70,44 @@ struct LEVELDB_EXPORT Options {
   Logger* info_log = nullptr;
 
   // -------------------
+  // If true, the database is opened for reading only:
+  //   * Open() takes no lock and changes nothing in the database directory:
+  //     it writes no files, removes none and starts no compactions.  Updates
+  //     found in the write-ahead logs are replayed into memory.
+  //   * Write(), Put() and Delete() return a NotSupported status and
+  //     CompactRange() does nothing.
+  //
+  // Without multi_process, the handle is a view of the database as of
+  // Open() and no other process may modify the database while it is open.
+  // Any number of processes can open the same database this way at once.
+  //
+  // With multi_process, the handle follows the changes made by the other
+  // processes that have the database open.
+  bool read_only = false;
+
+  // If true, several processes (and several handles within one process) may
+  // open the database at the same time, provided all of them set this
+  // option.  Any of them may write unless it also sets read_only.
+  //
+  //   * Writes from all processes are serialized through a lock file and
+  //     appended to one shared write-ahead log.
+  //   * Reads (Get, NewIterator, GetSnapshot) observe every write that
+  //     completed, in any process, before the read started.
+  //   * One process at a time, chosen automatically among the writable
+  //     ones, flushes memtables, runs compactions and deletes obsolete
+  //     files.  If it exits or dies another process takes over.
+  //   * A process that is killed loses nothing that Write() acknowledged,
+  //     to the extent a killed single-process writer would not either.
+  //
+  // The files written are in the standard format, so once every process
+  // has closed the database it can again be opened without this option.
+  //
+  // Each process keeps its own copy of the unflushed data and its own block
+  // and table caches.  Supported on Linux only; elsewhere Open() fails with
+  // a NotSupported status.  The Env must be the default Env.
+  bool multi_process = false;
+
+  // -------------------
   // Parameters that affect performance
 
   // Amount of data to build up in memory (backed by an unsorted log

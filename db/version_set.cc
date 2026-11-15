@@ -4,20 +4,23 @@
 
 #include "db/version_set.h"
 
-#include <algorithm>
-#include <cstdio>
-
 #include "db/filename.h"
 #include "db/log_reader.h"
+#include "db/log_tailer.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
+#include <algorithm>
+#include <cstdio>
+
 #include "leveldb/env.h"
 #include "leveldb/table_builder.h"
+
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/logging.h"
+#include "util/shared_state.h"
 
 namespace leveldb {
 
@@ -746,7 +749,11 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
       dummy_versions_(this),
-      current_(nullptr) {
+      current_(nullptr),
+      shared_(nullptr),
+      manifest_writer_(false),
+      manifest_tailer_(nullptr),
+      tailed_manifest_number_(0) {
   AppendVersion(new Version(this));
 }
 
@@ -755,6 +762,14 @@ VersionSet::~VersionSet() {
   assert(dummy_versions_.next_ == &dummy_versions_);  // List must be empty
   delete descriptor_log_;
   delete descriptor_file_;
+  delete manifest_tailer_;
+}
+
+uint64_t VersionSet::NewFileNumber() {
+  if (shared_ != nullptr) {
+    return shared_->NewFileNumber();
+  }
+  return next_file_number_++;
 }
 
 void VersionSet::AppendVersion(Version* v) {
@@ -775,9 +790,13 @@ void VersionSet::AppendVersion(Version* v) {
 }
 
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  // In multi-process mode only the manifest writer may get here.
+  assert(shared_ == nullptr || manifest_writer_);
+  const uint64_t next_file_number =
+      (shared_ != nullptr) ? shared_->NextFileNumber() : next_file_number_;
   if (edit->has_log_number_) {
     assert(edit->log_number_ >= log_number_);
-    assert(edit->log_number_ < next_file_number_);
+    assert(edit->log_number_ < next_file_number);
   } else {
     edit->SetLogNumber(log_number_);
   }
@@ -786,7 +805,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     edit->SetPrevLogNumber(prev_log_number_);
   }
 
-  edit->SetNextFile(next_file_number_);
+  edit->SetNextFile(next_file_number);
   edit->SetLastSequence(last_sequence_);
 
   Version* v = new Version(this);
@@ -814,6 +833,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   }
 
   // Unlock during expensive MANIFEST log write
+  uint64_t manifest_size = 0;
   {
     mu->Unlock();
 
@@ -836,11 +856,26 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       s = SetCurrentFile(env_, dbname_, manifest_file_number_);
     }
 
+    if (s.ok() && shared_ != nullptr) {
+      s = env_->GetFileSize(DescriptorFileName(dbname_, manifest_file_number_),
+                            &manifest_size);
+    }
+
     mu->Lock();
   }
 
   // Install the new version
   if (s.ok()) {
+    if (shared_ != nullptr) {
+      // Tell the other processes about the edit.  Until this point they
+      // read the manifest only up to the previously published offset.
+      SharedState::ManifestState state = shared_->ReadManifest(nullptr);
+      state.manifest_number = manifest_file_number_;
+      state.manifest_offset = manifest_size;
+      state.epoch++;
+      v->epoch_ = state.epoch;
+      shared_->PublishManifest(state);
+    }
     AppendVersion(v);
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
@@ -856,6 +891,115 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   }
 
   return s;
+}
+
+Status VersionSet::TailManifest(uint64_t manifest_number,
+                                uint64_t manifest_offset, uint64_t epoch) {
+  assert(shared_ != nullptr);
+  assert(!manifest_writer_);
+
+  // A different manifest starts with a full snapshot, so the state is
+  // rebuilt from an empty version rather than from current_.
+  const bool restart = (manifest_tailer_ == nullptr ||
+                        tailed_manifest_number_ != manifest_number);
+  if (!restart && manifest_tailer_->Position() == manifest_offset) {
+    return Status::OK();
+  }
+  if (restart) {
+    LogTailer* tailer =
+        new LogTailer(env_, DescriptorFileName(dbname_, manifest_number));
+    Status s = tailer->Open(0);
+    if (!s.ok()) {
+      delete tailer;
+      return s;
+    }
+    delete manifest_tailer_;
+    manifest_tailer_ = tailer;
+    tailed_manifest_number_ = manifest_number;
+  }
+  manifest_tailer_->SetLimit(manifest_offset);
+
+  Status s;
+  Version* v = nullptr;
+  bool have_log_number = false;
+  uint64_t log_number = 0;
+  bool have_prev_log_number = false;
+  uint64_t prev_log_number = 0;
+  {
+    Builder builder(this, restart ? new Version(this) : current_);
+    Slice record;
+    std::string scratch;
+    while (s.ok() && manifest_tailer_->ReadRecord(&record, &scratch)) {
+      VersionEdit edit;
+      s = edit.DecodeFrom(record);
+      if (s.ok() && edit.has_comparator_ &&
+          edit.comparator_ != icmp_.user_comparator()->Name()) {
+        s = Status::InvalidArgument(
+            edit.comparator_ + " does not match existing comparator ",
+            icmp_.user_comparator()->Name());
+      }
+      if (!s.ok()) break;
+      builder.Apply(&edit);
+      if (edit.has_log_number_) {
+        log_number = edit.log_number_;
+        have_log_number = true;
+      }
+      if (edit.has_prev_log_number_) {
+        prev_log_number = edit.prev_log_number_;
+        have_prev_log_number = true;
+      }
+      if (edit.has_next_file_number_ && edit.next_file_number_ > 0) {
+        shared_->MarkFileNumberUsed(edit.next_file_number_ - 1);
+      }
+      if (edit.has_last_sequence_ &&
+          edit.last_sequence_ > manifest_last_sequence_) {
+        manifest_last_sequence_ = edit.last_sequence_;
+      }
+    }
+    if (s.ok()) s = manifest_tailer_->status();
+    if (s.ok() && manifest_tailer_->Position() != manifest_offset) {
+      s = Status::Corruption("MANIFEST ends before its committed offset");
+    }
+    if (s.ok()) {
+      v = new Version(this);
+      builder.SaveTo(v);
+    }
+  }
+
+  if (s.ok()) {
+    Finalize(v);
+    v->epoch_ = epoch;
+    AppendVersion(v);
+    manifest_file_number_ = manifest_number;
+    if (have_log_number) log_number_ = log_number;
+    if (have_prev_log_number) prev_log_number_ = prev_log_number;
+  } else {
+    // Start over from the beginning of the manifest next time.
+    delete manifest_tailer_;
+    manifest_tailer_ = nullptr;
+    tailed_manifest_number_ = 0;
+  }
+  return s;
+}
+
+void VersionSet::BecomeManifestWriter() {
+  assert(shared_ != nullptr);
+  assert(descriptor_log_ == nullptr);
+  delete manifest_tailer_;
+  manifest_tailer_ = nullptr;
+  tailed_manifest_number_ = 0;
+  manifest_writer_ = true;
+  // The first LogAndApply() writes a snapshot into this new manifest.  The
+  // manifest being followed so far stays in place until then.
+  manifest_file_number_ = shared_->NewFileNumber();
+}
+
+uint64_t VersionSet::OldestPinnedEpoch() const {
+  const Version* oldest = dummy_versions_.next_;
+  if (oldest == current_ && current_->refs_ == 1) {
+    return SharedState::kNone;
+  }
+  return oldest->epoch_;
 }
 
 Status VersionSet::Recover(bool* save_manifest) {
@@ -1023,6 +1167,10 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
 }
 
 void VersionSet::MarkFileNumberUsed(uint64_t number) {
+  if (shared_ != nullptr) {
+    shared_->MarkFileNumberUsed(number);
+    return;
+  }
   if (next_file_number_ <= number) {
     next_file_number_ = number + 1;
   }

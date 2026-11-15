@@ -5,22 +5,26 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
+#include "db/dbformat.h"
+#include "db/log_writer.h"
+#include "db/snapshot.h"
 #include <atomic>
 #include <deque>
 #include <set>
 #include <string>
+#include <thread>
 
-#include "db/dbformat.h"
-#include "db/log_writer.h"
-#include "db/snapshot.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
 namespace leveldb {
 
+class LogTailer;
 class MemTable;
+class SharedState;
 class TableCache;
 class Version;
 class VersionEdit;
@@ -70,6 +74,9 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
+
+  // Multi-process only: called after an iterator dropped its references.
+  void MpIteratorDone();
 
  private:
   friend class DB;
@@ -151,6 +158,42 @@ class DBImpl : public DB {
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
+  // ---- Multi-process support.  See db_impl_mp.cc for the design. ----
+
+  // Open() for Options::multi_process.
+  Status MpOpen();
+  // As the first process to open the database, rebuild the shared state
+  // from the files in the database directory.
+  Status MpInitStateFromDisk() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Apply the MANIFEST edits and WAL records that other processes have
+  // committed since the last call.  Cheap if there are none.
+  Status CatchUp() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // Replay log file "number" from offset "from" into mem_.  If "final" the
+  // file is complete and is read to its end, otherwise up to "limit".
+  Status MpTailLog(uint64_t number, uint64_t from, uint64_t limit, bool final)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void MpNewMemTable() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Publish what this process is about to read, then catch up.
+  Status MpBeginRead() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // Publish what this process still reads after a read is over.
+  void MpEndRead() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Write path.  All REQUIRE the cross-process write lock.
+  Status MpPrepareWrite() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status MpMakeRoomForWrite(bool force) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status MpOpenLogForAppend(uint64_t log_number, uint64_t log_offset);
+
+  // Compactor role.
+  bool MpTryBecomeCompactor() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void MpRetainCurrentVersion() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // Returns false if table files must not be deleted right now.
+  bool MpReleaseRetainedVersions() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void MpCompactRange(const Slice* begin, const Slice* end);
+  void LocalCompactRange(const Slice* begin, const Slice* end);
+  void MpPollLoop();
+
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();
   }
@@ -203,6 +246,33 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+
+  // ---- Multi-process state.  mp_ is null unless options_.multi_process.
+  //
+  // In multi-process mode:
+  //   logfile_number_  is the log that mem_ mirrors (0: none yet)
+  //   mem_log_offset_  is how much of that log has been applied to mem_
+  //   imm_             mirrors all older logs that are not flushed yet
+  //   logfile_, log_   are this process's handle for appending to log
+  //                    number log_handle_number_ (opened lazily)
+  SharedState* mp_;
+  bool is_compactor_ GUARDED_BY(mutex_);
+  uint64_t mem_log_offset_ GUARDED_BY(mutex_);
+  bool mem_nonempty_ GUARDED_BY(mutex_);
+  uint64_t imm_log_number_ GUARDED_BY(mutex_);  // imm_ covers logs <= this
+  uint64_t log_handle_number_;
+  uint64_t wal_version_seen_ GUARDED_BY(mutex_);
+  uint64_t manifest_version_seen_ GUARDED_BY(mutex_);
+  LogTailer* wal_tailer_ GUARDED_BY(mutex_);
+  uint64_t wal_tailer_number_ GUARDED_BY(mutex_);
+  uint64_t published_pin_ GUARDED_BY(mutex_);
+  // Compactor only: versions kept alive because another process may still
+  // be reading their files, oldest first.
+  std::deque<Version*> retained_versions_ GUARDED_BY(mutex_);
+  // Compactor only: no table file may be deleted while any process pins an
+  // epoch older than this (the epoch at which this process took over).
+  uint64_t safe_epoch_ GUARDED_BY(mutex_);
+  std::thread poll_thread_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

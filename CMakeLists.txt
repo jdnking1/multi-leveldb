@@ -125,6 +125,7 @@ target_sources(leveldb
     "db/builder.h"
     "db/c.cc"
     "db/db_impl.cc"
+    "db/db_impl_mp.cc"
     "db/db_impl.h"
     "db/db_iter.cc"
     "db/db_iter.h"
@@ -136,6 +137,8 @@ target_sources(leveldb
     "db/log_format.h"
     "db/log_reader.cc"
     "db/log_reader.h"
+    "db/log_tailer.cc"
+    "db/log_tailer.h"
     "db/log_writer.cc"
     "db/log_writer.h"
     "db/memtable.cc"
@@ -189,6 +192,8 @@ target_sources(leveldb
     "util/no_destructor.h"
     "util/options.cc"
     "util/random.h"
+    "util/shared_state.cc"
+    "util/shared_state.h"
     "util/status.cc"
 
   # Only CMake 3.3+ supports PUBLIC sources in targets exported by "install".
@@ -400,6 +405,7 @@ if(LEVELDB_BUILD_TESTS)
       leveldb_test("util/env_windows_test.cc")
     else (WIN32)
       leveldb_test("util/env_posix_test.cc")
+      leveldb_test("db/multiprocess_test.cc")
     endif (WIN32)
   endif(NOT BUILD_SHARED_LIBS)
 endif(LEVELDB_BUILD_TESTS)
